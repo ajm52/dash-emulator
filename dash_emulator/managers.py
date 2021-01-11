@@ -61,6 +61,7 @@ class PlayManager(object):
             # Time
             self.playback_time = 0
             self.playback_start_realtime = 0
+            self.previous_segment_cutoff = 0
 
             # Asyncio Tasks
             # type: Optional[asyncio.Task]
@@ -134,6 +135,13 @@ class PlayManager(object):
         while True:
             await asyncio.sleep(self.cfg.update_interval)
             self.playback_time += self.cfg.update_interval
+            elapsed = self.playback_time - self.playback_start_realtime
+
+            if elapsed - self.cfg.segment_duration == self.previous_segment_cutoff:
+                self.previous_segment_cutoff += self.cfg.segment_duration # simulate playing of a segment
+                await events.EventBridge().trigger(events.Events.PlaySegment)
+
+
 
     def clear_download_task_sessions(self):
         self.download_task_sessions.clear()
@@ -522,7 +530,13 @@ class DownloadManager(object):
                 output = self.cfg.args['output']
                 if output is not None:
                     f = open(output + '/' + url.split('/')[-1], 'wb')
+
+                # ensuring BETA doesn't read segment length before it is set.
+                await download_progress_monitor.segment_condition.acquire()
                 download_progress_monitor.segment_length = int(resp.headers["Content-Length"])
+                download_progress_monitor.segment_condition.notify()
+                download_progress_monitor.segment_condition.release()
+
                 while True:
                     chunk = await resp.content.read(self.cfg.chunk_size)
                     if not chunk:

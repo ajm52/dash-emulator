@@ -104,6 +104,12 @@ class BufferMonitor(object):
         events.EventBridge().add_listener(
             events.Events.SegmentDownloadComplete, feed_segment)
 
+        async def play_segment(duration, *args, **kwargs):
+            self._buffer -= duration
+            await events.Events().trigger(events.Events.BufferUpdated, buffer=self._buffer)
+
+        events.EventBridge().add_listener(events.Events.PlaySegment, play_segment)
+
     @property
     def buffer(self):
         return self._buffer
@@ -111,11 +117,31 @@ class BufferMonitor(object):
 
 class DownloadProgressMonitor(object):
     def __init__(self, cfg, session):
+        self.segment_condition = asyncio.Condition()
         self.segment_length = 0
         self.task = None  # type: asyncio.Task
         self.config = cfg
         self.downloaded = 0
         self.session = session
+
+    async def wait_then_check(self,timeout):
+        """
+        used purely to remove code duplication in the method below.
+        """
+        await asyncio.sleep(self.config.timeout_max_ratio - timeout)
+        # re-check status of downloaded frames
+        downloaded = self.downloaded
+        downloaded_ratio = downloaded / length
+        if downloaded_ratio < self.config.min_frame_chunk_ratio:
+            # f_i < f_i^{min} (drop and replace single tile-segment @ lowest quality)
+            if self.session.representation_indices[self.session.adaptation_set.id] != 0:
+                self.task.cancel()
+                await events.EventBridge().trigger(events.Events.RedoTileAtLowest,
+                                                           adaptation_set=self.session.adaptation_set)
+                return
+            else:
+                # f_i >= f_i^{min} (accept partial segment)
+                self.task.cancel()
 
     async def start(self):
         """
@@ -135,10 +161,16 @@ class DownloadProgressMonitor(object):
         else:
             bandwidth = SpeedMonitor().get_speed()
 
-        # while self.segment_length == 0:
-        #     await asyncio.sleep(0.1)
-        
+        # ensuring segment length is set elsewhere before we access it here.
+        await self.segment_condition.acquire()
+        while self.segment_length == 0:
+            try:
+                await self.segment_condition.wait()
+            except RuntimeError as e:
+                await asyncio.sleep(0.1)
         length = self.segment_length
+        self.segment_condition.release()
+
         timeout = length * 8 / bandwidth
         # if the segment is downloaded fully before timeout finishes, this task will be cancelled via DownloadManager.
         await asyncio.sleep(timeout)
@@ -159,21 +191,9 @@ class DownloadProgressMonitor(object):
                     return
             else:
                 # otherwise, buffer level is healthy; we can wait a bit longer (t_max - timeout)
-                await asyncio.sleep(self.config.timeout_max_ratio - timeout)
-                # re-check status of downloaded frames
-                downloaded = self.downloaded
-                downloaded_ratio = downloaded / length
-                if downloaded_ratio < self.config.min_frame_chunk_ratio:
-                    # f_i < f_i^{min} (drop and replace single tile-segment @ lowest quality)
-                    if self.session.representation_indices[self.session.adaptation_set.id] != 0:
-                        self.task.cancel()
-                        await events.EventBridge().trigger(events.Events.RedoTileAtLowest,
-                                                           adaptation_set=self.session.adaptation_set)
-                        return
-                    else:
-                        # f_i >= f_i^{min} (accept partial segment)
-                        self.task.cancel()
-        else:
+                await wait_then_check(self.config.timeout_max_ratio - timeout)
+
+        else: # f_i^{min} <= f_i 
             if downloaded_ratio < self.config.vq_threshold:
                 if buffer_level < self.config.min_buffer_length:
                     # l < l^{min} (drop and replace single tile-segment @ lowest quality)
@@ -184,21 +204,7 @@ class DownloadProgressMonitor(object):
                         return
                 else:
                     # otherwise, buffer level is healthy; we can wait a bit longer (t_max - timeout)
-                    await asyncio.sleep(self.config.timeout_max_ratio - timeout)
-
-                    # re-check status of downloaded frames
-                    downloaded = self.downloaded
-                    downloaded_ratio = downloaded / length
-                    if downloaded_ratio < self.config.min_frame_chunk_ratio:
-                        # f_i < f_i^{min} (drop and replace single tile-segment @ lowest quality)
-                        if self.session.representation_indices[self.session.adaptation_set.id] != 0:
-                            self.task.cancel()
-                            await events.EventBridge().trigger(events.Events.RedoTileAtLowest,
-                                                               adaptation_set=self.session.adaptation_set)
-                            return
-                    else:
-                        # f_i >= f_i^{min} (accept partial segment)
-                        self.task.cancel()
+                    await wait_then_check(self.config.timeout_max_ratio - timeout)
             else:
                 # f_i >= f_i^{VQ} (we accept a partial segment)
                 self.task.cancel()
