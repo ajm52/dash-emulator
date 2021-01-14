@@ -25,6 +25,8 @@ class Config(object):
         # ideally, we want at least 3 seconds of playback in the buffer.
         self.min_buffer_length = 3.0
 
+        self.buffer_capacity = 10.0 
+
         # VQ threshold
         self.vq_threshold = 0.8
 
@@ -44,3 +46,7 @@ class Config(object):
 
         # User input args
         self.args = args
+
+        self.segment_duration = 1.0 # seconds
+
+        self.buffer_overflow_warning_level = self.buffer_capacity - self.segment_duration

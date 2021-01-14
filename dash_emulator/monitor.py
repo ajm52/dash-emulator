@@ -1,5 +1,6 @@
 import asyncio
 import time
+import queue
 from typing import Optional
 
 from dash_emulator import logger, events, config, events
@@ -91,24 +92,24 @@ class BufferMonitor(object):
             self.inited = True
 
             self.cfg = None
-
+            self.buffer_condition = asyncio.Condition()
+            self.buffer_full_condition = asyncio.Condition() 
             self._buffer = 0
 
     def init(self, cfg):
         self.cfg = cfg
+        self.segment_queue_size = int(self.cfg.segment_duration * self.cfg.buffer_capacity)
+        self.segment_queue = queue.Queue(maxsize=self.segment_queue_size) # our segment playback buffer
 
         async def feed_segment(duration, *args, **kwargs):
+            await self.buffer_condition.acquire()
             self._buffer += duration
+            self.segment_queue.put(duration)
+            self.buffer_condition.release()
             await events.EventBridge().trigger(events.Events.BufferUpdated, buffer=self._buffer)
 
         events.EventBridge().add_listener(
             events.Events.SegmentDownloadComplete, feed_segment)
-
-        async def play_segment(duration, *args, **kwargs):
-            self._buffer -= duration
-            await events.Events().trigger(events.Events.BufferUpdated, buffer=self._buffer)
-
-        events.EventBridge().add_listener(events.Events.PlaySegment, play_segment)
 
     @property
     def buffer(self):
@@ -187,7 +188,7 @@ class DownloadProgressMonitor(object):
                 if self.session.representation_indices[self.session.adaptation_set.id] != 0:
                     self.task.cancel()
                     await events.EventBridge().trigger(events.Events.RedoTileAtLowest,
-                                                       adaptation_set=self.session.adaptation_set)
+                                                       session=self.session)
                     return
             else:
                 # otherwise, buffer level is healthy; we can wait a bit longer (t_max - timeout)
@@ -200,7 +201,7 @@ class DownloadProgressMonitor(object):
                     if self.session.representation_indices[self.session.adaptation_set.id] != 0:
                         self.task.cancel()
                         await events.EventBridge().trigger(events.Events.RedoTileAtLowest,
-                                                           adaptation_set=self.session.adaptation_set)
+                                                           session=self.session)
                         return
                 else:
                     # otherwise, buffer level is healthy; we can wait a bit longer (t_max - timeout)

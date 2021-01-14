@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import logging
+import math
 from typing import Optional, Dict
 
 import aiohttp
@@ -61,13 +62,15 @@ class PlayManager(object):
             # Time
             self.playback_time = 0
             self.playback_start_realtime = 0
-            self.previous_segment_cutoff = 0
+            self.playback_time_ready = 0.0
 
             # Asyncio Tasks
             # type: Optional[asyncio.Task]
             self.task_check_buffer_sufficient = None
             # type: Optional[asyncio.Task]
             self.task_update_playback_time = None
+            # type: Optional[asyncio.Task]
+            self.task_do_playback = None
 
             # Playback Control
             self.abr_controller = None  # type: Optional[abr.ABRController]
@@ -82,9 +85,14 @@ class PlayManager(object):
             # Download task sessions
             # type: Dict[str, PlayManager.DownloadTaskSession]
             self.download_task_sessions = dict()
+            # type: Dict[str, bool]
+            self.finished = dict()
 
             # Current downloading segment index
             self.segment_index = 0
+
+            self.buffer_full_condition = asyncio.Condition()
+            self.buffer_condition = asyncio.Condition()
 
     def switch_state(self, state):
         if state == "READY" or state == PlayManager.State.READY:
@@ -116,32 +124,70 @@ class PlayManager(object):
 
     @property
     def buffer_level(self):
-        return (monitor.BufferMonitor().buffer - self.playback_time) * 1000
+        # returns the number of seconds in the buffer
+        return monitor.BufferMonitor().buffer
 
-    async def check_buffer_sufficient(self):
+    async def do_playback(self):
+        """main method responsible for controlling
+        the flow of segment playback.
+        Alternates between pulling segments from the queue and sleeping.
+
+        """
         while True:
-            if self.buffer_level > 0:
-                log.info("Buffer level sufficient: %.1f seconds" %
-                         (self.buffer_level / 1000))
-                await asyncio.sleep(min(1, self.buffer_level / 1000))
+            # check out the segment buffer
+            print('do_playback: buffer_condition acquiring')
+            await self.buffer_condition.acquire()
+            print('do_playback: buffer_condition acquired')
+            q = monitor.BufferMonitor().segment_queue
+            num_segments = q.qsize()
+            if num_segments == 0:
+                self.buffer_condition.release()
+
+                if self.mpd.mediaPresentationDuration <= self.playback_time:
+                    await events.EventBridge().trigger(events.Events.End)
+                    break
+                else:
+                    await events.EventBridge().trigger(events.Events.Stall)   
+                    break 
             else:
-                break
-        if self.mpd.mediaPresentationDuration <= self.playback_time:
-            await events.EventBridge().trigger(events.Events.End)
-        else:
-            await events.EventBridge().trigger(events.Events.Stall)
+                if monitor.BufferMonitor().segment_queue.full() or monitor.BufferMonitor().buffer >= self.cfg.buffer_overflow_warning_level:
+                    # if close to overflow, need to acquire, notify, and release.
+                    print('do_playback: buffer_full_condition before acquire')
+                    await self.buffer_full_condition.acquire()
+                    print('do_playback: buffer_full_condition after acquire')
+                    while q.qsize() > num_segments / 2:
+                        duration = q.get()
+                        self.playback_time_ready += duration
+                        monitor.BufferMonitor()._buffer -= duration
 
-    async def update_current_time(self):
-        while True:
-            await asyncio.sleep(self.cfg.update_interval)
-            self.playback_time += self.cfg.update_interval
-            elapsed = self.playback_time - self.playback_start_realtime
+                    self.buffer_condition.release()
+                    print('do_playback: buffer_condition released')
+                    self.buffer_full_condition.notify_all()
+                    print('do_playback: buffer_full_condition after notify_all')
+                    self.buffer_full_condition.release()
+                    print('do_playback: buffer_full_condition after release')
+                elif num_segments >= 2 * self.cfg.min_buffer_length:
+                    # if not close to overflow, but still quite full.
+                    num_to_pull = math.floor(num_segments / 2)
+                    while num_to_pull > 0:
+                        duration = q.get()
+                        self.playback_time_ready += duration
+                        monitor.BufferMonitor()._buffer -= duration
+                        num_to_pull -= 1
+                    self.buffer_condition.release()
+                else:
+                    # all other cases (close or below the minimum buffer level)
+                    duration = q.get()
+                    self.playback_time_ready += duration
+                    monitor.BufferMonitor()._buffer -= duration
+                    self.buffer_condition.release()
 
-            if elapsed - self.cfg.segment_duration == self.previous_segment_cutoff:
-                self.previous_segment_cutoff += self.cfg.segment_duration # simulate playing of a segment
-                await events.EventBridge().trigger(events.Events.PlaySegment)
+                # once we've pulled our segments, "play them"
+                await asyncio.sleep(self.playback_time_ready)
 
-
+                self.playback_time += self.playback_time_ready
+                self.playback_time_ready = 0.0
+                await events.EventBridge().trigger(events.Events.BufferUpdated, buffer=self.buffer_level)
 
     def clear_download_task_sessions(self):
         self.download_task_sessions.clear()
@@ -184,13 +230,15 @@ class PlayManager(object):
             segment_download_session = PlayManager.DownloadTaskSession(adaptation_set,
                                                                        representation.urls[segment_number], None,
                                                                        representation.durations[segment_number],
-                                                                       self.representation_indices
+                                                                       self.representation_indices,
+                                                                       segment_index=self.segment_index
                                                                        )
             if not representation.is_inited:
                 init_download_session = PlayManager.DownloadTaskSession(adaptation_set,
                                                                         representation.initialization_url,
                                                                         segment_download_session, 0,
-                                                                        self.representation_indices)
+                                                                        self.representation_indices,
+                                                                        segment_index=self.segment_index)
                 representation.is_inited = True
                 self.download_task_sessions[adaptation_set.id] = init_download_session
             else:
@@ -213,45 +261,42 @@ class PlayManager(object):
 
         events.EventBridge().add_listener(events.Events.CanPlay, can_play)
 
-        async def play():
-            log.info("Video playback started")
+        async def start_playback():
+            log.info('Playback Started!')
             self.playback_start_realtime = time.time()
+            await events.EventBridge().trigger(events.Events.Play)
+        events.EventBridge().add_listener(events.Events.BeginPlayback, start_playback)
+        
+        async def resume_playback():
+            log.info('Resuming Playback!')
+            await events.EventBridge().trigger(events.Events.Play)
+        events.EventBridge().add_listener(events.Events.ResumePlayback, resume_playback)
 
+        async def play():
             try:
-                self.task_update_playback_time = asyncio.create_task(
-                    self.update_current_time())
+                self.task_do_playback = asyncio.create_task(
+                    self.do_playback())
             except AttributeError:
                 loop = asyncio.get_event_loop()
-                self.task_update_playback_time = loop.create_task(
-                    self.update_current_time())
-
-            try:
-                self.task_check_buffer_sufficient = asyncio.create_task(
-                    self.check_buffer_sufficient())
-            except AttributeError:
-                loop = asyncio.get_event_loop()
-                self.task_check_buffer_sufficient = loop.create_task(
-                    self.check_buffer_sufficient())
+                self.task_do_playback = loop.create_task(
+                    self.do_playback())
             self.switch_state("PLAYING")
-
         events.EventBridge().add_listener(events.Events.Play, play)
 
         async def stall():
-            if self.task_update_playback_time is not None:
-                self.task_update_playback_time.cancel()
-            if self.task_check_buffer_sufficient is not None:
-                self.task_check_buffer_sufficient.cancel()
+            if self.task_do_playback is not None:
+                self.task_do_playback.cancel()
 
             log.debug("Stall happened")
             self.switch_state("STALLING")
             before_stall = time.time()
             while True:
                 await asyncio.sleep(self.cfg.update_interval)
-                if monitor.BufferMonitor().buffer - self.playback_time > self.mpd.minBufferTime:
+                if monitor.BufferMonitor().buffer > self.mpd.minBufferTime:
                     break
             log.debug("Stall ends, duration: %.3f" %
                       (time.time() - before_stall))
-            await events.EventBridge().trigger(events.Events.Play)
+            await events.EventBridge().trigger(events.Events.ResumePlayback)
 
         events.EventBridge().add_listener(events.Events.Stall, stall)
 
@@ -282,12 +327,37 @@ class PlayManager(object):
 
         async def download_next(session: PlayManager.DownloadTaskSession, *args, **kwargs):
             if session.next_task is None:
-                del self.download_task_sessions[session.adaptation_set.id]
+                try:
+                    del self.download_task_sessions[session.adaptation_set.id]
+                    self.finished[session.adaptation_set.id] = True
+                except KeyError:
+                    return
             else:
                 self.download_task_sessions[session.adaptation_set.id] = session.next_task
                 await events.EventBridge().trigger(events.Events.DownloadStart, session=session.next_task)
                 return
             if len(self.download_task_sessions) == 0:
+                self.finished.clear()
+                # only start next set of downloads if we have room in the buffer to feed the segment we just finished downloading
+                print('download-next: buffer_condition acquiring')
+                await self.buffer_condition.acquire()
+                print('download-next: buffer_condition acquired')
+                buffer_level = monitor.BufferMonitor().buffer
+                if buffer_level >= self.cfg.buffer_overflow_warning_level or monitor.BufferMonitor().segment_queue.full():
+                    self.buffer_condition.release()
+                    acquired = await self.buffer_full_condition.acquire()
+                    while buffer_level >= self.cfg.buffer_overflow_warning_level or monitor.BufferMonitor().segment_queue.full():
+                        try:
+                            print('download-next: waiting on buffer full')
+                            await self.buffer_full_condition.wait()
+                            buffer_level = monitor.BufferMonitor().buffer
+                        except RuntimeError:
+                            await asyncio.sleep(0.1)
+                    self.buffer_full_condition.release()
+                    print('download-next: buffer full released')
+                else:
+                    self.buffer_condition.release()
+
                 await events.EventBridge().trigger(events.Events.SegmentDownloadComplete,
                                                    segment_index=self.segment_index, duration=session.duration)
                 self.segment_index += 1
@@ -304,9 +374,16 @@ class PlayManager(object):
                     for adaptation_set_id, session in self.download_task_sessions.items():
                         await events.EventBridge().trigger(events.Events.DownloadStart, session=session)
 
-        async def check_canplay(*args, **kwargs):
-            if self.ready and self.buffer_level > self.mpd.minBufferTime:
-                await events.EventBridge().trigger(events.Events.CanPlay)
+        async def check_canplay(buffer, *args, **kwargs):
+            '''
+            used to check if PlaybackManager may 'start' or 'resume' playback.
+            NOTE this event should not be triggered periodically!!!
+            '''
+            if self.state != PlayManager.State.READY:
+                return
+            
+            if buffer >= self.cfg.min_buffer_length:
+                await events.EventBridge().trigger(events.Events.BeginPlayback)
 
         events.EventBridge().add_listener(events.Events.DownloadComplete, download_next)
         events.EventBridge().add_listener(events.Events.BufferUpdated, check_canplay)
@@ -628,5 +705,5 @@ class DownloadManager(object):
             await events.EventBridge().trigger(events.Events.DownloadComplete, session=session)
 
         events.EventBridge().add_listener(events.Events.DownloadStart, start_download)
-        events.EventBridge().add_listener(events.Events.SegmentDownloadComplete, self.record_buffer_level)
+        events.EventBridge().add_listener(events.Events.BufferUpdated, self.record_buffer_level)
         events.EventBridge().add_listener(events.Events.End, self.dump_results)

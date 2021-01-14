@@ -27,6 +27,16 @@ class Event(object):
 
 
 class Events(object):
+    class ResumePlayback(Event):
+        """
+        Event triggered when playback is resumed (NOT called when started for the first time)
+        """
+        pass
+    class BeginPlayback(Event):
+        """
+        Event triggered when playback is started for the first time.
+        """
+        pass
     class DownloadEnd(Event):
         """
         Event triggered when downloading has end, but the playback is not over
